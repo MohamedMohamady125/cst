@@ -1,0 +1,74 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy.integrate import solve_ivp
+
+# ----------------------------
+# User parameters (defaults)
+# ----------------------------
+C = 100.0       # J/°C
+k = 5.0         # W/°C
+eta = 1.0       # fraction
+Tamb = 25.0     # °C
+T0 = 25.0       # °C
+t_max = 50.0    # s
+throttle_thresh = 95.0  # °C
+
+# Example power profile: step load
+def P(t):
+    return 10.0 if t < 10 else 50.0
+
+# ----------------------------
+# ODE definition
+# ----------------------------
+def f(t, T):
+    return (-k / C) * (T - Tamb) + (eta / C) * P(t)
+
+# ----------------------------
+# Solve ODE
+# ----------------------------
+t_span = (0, t_max)
+t_eval = np.linspace(0, t_max, 500)
+
+sol = solve_ivp(f, t_span, [T0], t_eval=t_eval, method="RK45", rtol=1e-6, atol=1e-8)
+
+t = sol.t
+T = sol.y[0]
+Pvals = [P(tt) for tt in t]
+
+# ----------------------------
+# Metrics
+# ----------------------------
+peak_T = np.max(T)
+peak_time = t[np.argmax(T)]
+settle_T = Tamb + eta * Pvals[-1] / k
+tau = C / k
+t90 = 2.3 * tau
+
+print(f"Peak temperature: {peak_T:.2f} °C at {peak_time:.2f} s")
+print(f"90% steady state time (approx): {t90:.2f} s")
+if np.any(T > throttle_thresh):
+    dur = np.sum(np.diff(t)[T[:-1] > throttle_thresh])
+    print(f"Throttle threshold exceeded for {dur:.2f} s")
+
+# ----------------------------
+# Visualization
+# ----------------------------
+plt.figure(figsize=(8,5))
+plt.plot(t, T, label="CPU Temperature (°C)")
+plt.axhline(Tamb, color="gray", linestyle="--", label="Ambient")
+plt.axhline(throttle_thresh, color="red", linestyle="--", label="Throttle Threshold")
+plt.scatter(peak_time, peak_T, color="black", zorder=5, label="Peak Temp")
+plt.fill_between(t, T - 0.5, T + 0.5, color="blue", alpha=0.1, label="Error Band (±0.5°C)")
+plt.xlabel("Time (s)")
+plt.ylabel("Temperature (°C)")
+plt.title("CPU Core Temperature vs. Time under Load")
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.savefig("temperature_vs_time.png")
+plt.show()
+
+# Save CSV
+df = pd.DataFrame({"t": t, "T": T, "P": Pvals})
+df.to_csv("solution.csv", index=False) 
