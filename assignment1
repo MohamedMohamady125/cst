@@ -1,3 +1,6 @@
+# code created by Mohamed Mohamady and Andres Reyes Fragoso
+# packages or libraries used are numpy, pandas, matplotlib and solve_ivp
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
