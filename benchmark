@@ -1,0 +1,524 @@
+
+
+Authors: Mohamed Mohamady , Andres Reyes
+Date: October 2025
+
+
+
+import numpy as np
+from scipy.integrate import odeint
+from scipy.ndimage import gaussian_filter
+import matplotlib.pyplot as plt
+from matplotlib.gridspec import GridSpec
+from PIL import Image
+import os
+from datetime import datetime
+from skimage.metrics import structural_similarity as ssim
+from skimage.metrics import peak_signal_noise_ratio as psnr
+import warnings
+warnings.filterwarnings('ignore')
+
+class DataDegradationModel:
+    """
+    Models data degradation in flash memory using coupled ODEs.
+    
+    State variables:
+    x1: Memory cell charge integrity (0-100%)
+    x2: Oxide layer integrity (0-100%)
+    x3: Error correction capability (0-100%)
+    x4: Physical substrate integrity (0-100%)
+    x5: Overall data readability (0-100%)
+    """
+    
+    def __init__(self, degradation_multiplier=1.0):
+        """
+        Initialize model with realistic degradation rates for 10-year lifespan
+        
+        Parameters:
+        degradation_multiplier: Factor to speed up or slow down degradation (default 1.0)
+        """
+        # Base degradation rates (per day) - calibrated for 10-year lifespan
+        # Using -ln(target_remaining)/days formula
+        # For 50% after 10 years: -ln(0.5)/3650 = 0.0001898
+        
+        # Individual component rates (different degradation speeds)
+        self.alpha1 = 0.0001898 * 1.2 * degradation_multiplier  # Charge leakage (fastest) ~43% after 10y
+        self.alpha2 = 0.0001898 * 0.8 * degradation_multiplier  # Oxide breakdown (slower) ~58% after 10y
+        self.alpha3 = 0.0001898 * 1.0 * degradation_multiplier  # ECC degradation (medium) ~50% after 10y
+        self.alpha4 = 0.0001898 * 0.6 * degradation_multiplier  # Physical degradation (slowest) ~68% after 10y
+        self.alpha5 = 0.0001898 * 0.5 * degradation_multiplier  # System degradation (very slow) ~74% after 10y
+        
+        # Environmental parameters
+        self.base_temp = 20  # Base temperature (Celsius)
+        self.temp_amplitude = 10  # Temperature variation
+        
+    def temperature(self, t):
+        """Seasonal temperature variation"""
+        return self.base_temp + self.temp_amplitude * np.sin(2 * np.pi * t / 365)
+    
+    def ode_system(self, state, t):
+        """
+        SIMPLIFIED AND STABLE ODE system
+        Uses pure exponential decay with minimal environmental effects
+        
+        Parameters:
+        state: Current state vector [x1, x2, x3, x4, x5]
+        t: Current time (days)
+        
+        Returns:
+        derivatives: Rate of change for each state variable
+        """
+        x1, x2, x3, x4, x5 = state
+        
+        # Temperature effect (very small modulation)
+        T = self.temperature(t)
+        temp_factor = 1.0 + 0.01 * (T - 20) / 20  # Max ±1% variation
+        
+        # Simple exponential decay: dx/dt = -α*x
+        # With slight temperature modulation for x1 (charge is temperature sensitive)
+        dx1dt = -self.alpha1 * x1 * temp_factor
+        dx2dt = -self.alpha2 * x2
+        dx3dt = -self.alpha3 * x3
+        dx4dt = -self.alpha4 * x4
+        
+        # x5 follows the average of other components (no feedback loop)
+        # This represents overall system health
+        avg_integrity = (x1 + x2 + x3 + x4) / 4
+        # x5 slowly converges to average of other components
+        dx5dt = -self.alpha5 * (x5 - avg_integrity)
+        
+        return [dx1dt, dx2dt, dx3dt, dx4dt, dx5dt]
+
+
+class ImageDegradation:
+    """Applies degradation effects to images based on ODE solutions"""
+    
+    def __init__(self, image_path=None):
+        """Initialize with an image"""
+        if image_path and os.path.exists(image_path):
+            self.original_image = np.array(Image.open(image_path))
+        else:
+            # Create a synthetic test image if no path provided
+            self.original_image = self.create_test_image()
+        
+        self.height, self.width = self.original_image.shape[:2]
+        
+    def create_test_image(self, size=(480, 640)):
+        """Create a synthetic test image with patterns"""
+        height, width = size
+        image = np.zeros((height, width, 3), dtype=np.uint8)
+        
+        # Create gradient background
+        for i in range(height):
+            for j in range(width):
+                image[i, j] = [
+                    int(255 * i / height),  # Red gradient
+                    int(255 * j / width),   # Green gradient
+                    int(255 * (1 - i / height))  # Blue gradient
+                ]
+        
+        # Add some geometric patterns
+        # Circles
+        center1 = (height // 3, width // 3)
+        center2 = (2 * height // 3, 2 * width // 3)
+        radius = min(height, width) // 6
+        
+        y, x = np.ogrid[:height, :width]
+        mask1 = (x - center1[1])**2 + (y - center1[0])**2 <= radius**2
+        mask2 = (x - center2[1])**2 + (y - center2[0])**2 <= radius**2
+        
+        image[mask1] = [255, 255, 0]  # Yellow circle
+        image[mask2] = [0, 255, 255]  # Cyan circle
+        
+        # Add text-like pattern (grid)
+        for i in range(0, height, 20):
+            image[i:i+2, :] = [100, 100, 100]
+        for j in range(0, width, 20):
+            image[:, j:j+2] = [100, 100, 100]
+        
+        return image
+    
+    def apply_bit_flips(self, image, charge_integrity):
+        """Simulate bit flips based on charge leakage"""
+        degraded = image.copy().astype(np.float32)
+        
+        # Progressive degradation based on integrity loss
+        if charge_integrity < 95:
+            degradation_level = (100 - charge_integrity) / 100
+            
+            # Number of affected pixels increases with degradation
+            num_flips = int(self.height * self.width * degradation_level * 0.001)
+            
+            if num_flips > 0:
+                # Random pixel locations
+                flip_y = np.random.randint(0, self.height, num_flips)
+                flip_x = np.random.randint(0, self.width, num_flips)
+                
+                # Apply noise proportional to degradation
+                for y, x in zip(flip_y, flip_x):
+                    if len(image.shape) == 3:
+                        channel = np.random.randint(0, 3)
+                        noise_val = np.random.randint(-int(50 * degradation_level), int(50 * degradation_level))
+                        degraded[y, x, channel] = np.clip(degraded[y, x, channel] + noise_val, 0, 255)
+                    else:
+                        noise_val = np.random.randint(-int(50 * degradation_level), int(50 * degradation_level))
+                        degraded[y, x] = np.clip(degraded[y, x] + noise_val, 0, 255)
+        
+        return np.clip(degraded, 0, 255).astype(np.uint8)
+    
+    def apply_oxide_noise(self, image, oxide_integrity):
+        """Add noise based on oxide layer breakdown"""
+        degraded = image.copy().astype(np.float32)
+        
+        if oxide_integrity < 90:
+            # Gaussian noise increases as oxide degrades
+            noise_level = (90 - oxide_integrity) * 0.3
+            
+            if noise_level > 0:
+                noise = np.random.normal(0, noise_level, image.shape)
+                degraded = degraded + noise
+        
+        return np.clip(degraded, 0, 255).astype(np.uint8)
+    
+    def apply_ecc_artifacts(self, image, ecc_capability):
+        """Simulate uncorrectable errors as block artifacts"""
+        degraded = image.copy()
+        
+        # ECC starts failing below 70%
+        if ecc_capability < 70:
+            block_size = 8
+            error_rate = (70 - ecc_capability) / 70 * 0.02
+            
+            for i in range(0, self.height - block_size, block_size):
+                for j in range(0, self.width - block_size, block_size):
+                    if np.random.random() < error_rate:
+                        # Corrupt block with shifted values
+                        if len(image.shape) == 3:
+                            shift = np.random.randint(-20, 20, (1, 1, 3))
+                            degraded[i:i+block_size, j:j+block_size] = np.clip(
+                                degraded[i:i+block_size, j:j+block_size].astype(np.float32) + shift,
+                                0, 255
+                            )
+                        else:
+                            shift = np.random.randint(-20, 20)
+                            degraded[i:i+block_size, j:j+block_size] = np.clip(
+                                degraded[i:i+block_size, j:j+block_size].astype(np.float32) + shift,
+                                0, 255
+                            )
+        
+        return degraded.astype(np.uint8)
+    
+    def apply_physical_damage(self, image, physical_integrity):
+        """Simulate dead pixel regions from physical damage"""
+        degraded = image.copy()
+        
+        # Physical damage appears below 80%
+        if physical_integrity < 80:
+            damage_level = (80 - physical_integrity) / 80
+            num_dead_zones = int(damage_level * 10)
+            
+            for _ in range(num_dead_zones):
+                size = np.random.randint(2, int(5 + 5 * damage_level))
+                y = np.random.randint(0, max(1, self.height - size))
+                x = np.random.randint(0, max(1, self.width - size))
+                
+                # Dead pixels (black or stuck values)
+                if np.random.random() < 0.5:
+                    degraded[y:y+size, x:x+size] = 0  # Black
+                else:
+                    degraded[y:y+size, x:x+size] = 255  # White (stuck high)
+        
+        return degraded
+    
+    def degrade_image(self, state):
+        """Apply all degradation effects based on current ODE state"""
+        x1, x2, x3, x4, x5 = state
+        
+        # Start with original
+        degraded = self.original_image.copy()
+        
+        # Apply degradation effects progressively
+        degraded = self.apply_bit_flips(degraded, x1)
+        degraded = self.apply_oxide_noise(degraded, x2)
+        degraded = self.apply_ecc_artifacts(degraded, x3)
+        degraded = self.apply_physical_damage(degraded, x4)
+        
+        # Overall quality reduction when system integrity is low
+        if x5 < 60:
+            # Apply slight blur for severe degradation
+            blur_amount = (60 - x5) / 60 * 0.8
+            if len(degraded.shape) == 3:
+                for c in range(3):
+                    degraded[:,:,c] = gaussian_filter(degraded[:,:,c], sigma=blur_amount)
+            else:
+                degraded = gaussian_filter(degraded, sigma=blur_amount)
+        
+        return degraded.astype(np.uint8)
+
+
+class DegradationSimulator:
+    """Main simulation controller"""
+    
+    def __init__(self, duration_days=3650, degradation_multiplier=1.0):
+        """
+        Initialize simulator
+        
+        Parameters:
+        duration_days: Simulation duration in days (default 10 years)
+        degradation_multiplier: Speed up or slow down degradation
+        """
+        self.model = DataDegradationModel(degradation_multiplier)
+        self.image_degrader = ImageDegradation()
+        self.duration = duration_days
+        
+        # Time points for evaluation (more points for smoother curves)
+        self.time_points = np.linspace(0, duration_days, 100)
+        
+        # Storage for results
+        self.states = None
+        self.degraded_images = []
+        self.metrics = {
+            'time': [],
+            'psnr': [],
+            'ssim': [],
+            'ber': [],
+            'integrity': []
+        }
+        
+    def run_simulation(self):
+        """Execute the complete simulation"""
+        print("Starting Data Degradation Simulation...")
+        print(f"Duration: {self.duration} days ({self.duration/365:.1f} years)")
+        print("-" * 50)
+        
+        # Initial conditions (all systems at 100%)
+        initial_state = [100.0, 100.0, 100.0, 100.0, 100.0]
+        
+        # Solve ODE system
+        print("Solving ODE system...")
+        self.states = odeint(self.model.ode_system, initial_state, self.time_points)
+        
+        # Debug: Check if states are reasonable
+        print(f"Initial state: {self.states[0]}")
+        print(f"Mid-point state (day {self.time_points[len(self.time_points)//2]:.0f}): {self.states[len(self.states)//2]}")
+        print(f"Final state (day {self.time_points[-1]:.0f}): {self.states[-1]}")
+        
+        # Generate degraded images at key points
+        key_times = [0, 365, 730, 1825, 3650]  # 0, 1, 2, 5, 10 years
+        key_indices = [np.argmin(np.abs(self.time_points - t)) for t in key_times if t <= self.duration]
+        
+        print("\nGenerating degraded images...")
+        print("\nDetailed state evolution:")
+        original_gray = np.mean(self.image_degrader.original_image, axis=2) if len(self.image_degrader.original_image.shape) == 3 else self.image_degrader.original_image
+        
+        for i, idx in enumerate(key_indices):
+            state = self.states[idx]
+            time_days = self.time_points[idx]
+            
+            # Generate degraded image
+            degraded = self.image_degrader.degrade_image(state)
+            self.degraded_images.append(degraded)
+            
+            # Calculate metrics
+            degraded_gray = np.mean(degraded, axis=2) if len(degraded.shape) == 3 else degraded
+            
+            # PSNR
+            try:
+                if np.array_equal(original_gray, degraded_gray):
+                    psnr_value = float('inf')
+                else:
+                    psnr_value = psnr(original_gray, degraded_gray, data_range=255)
+            except:
+                psnr_value = 20.0
+            
+            # SSIM
+            try:
+                ssim_value = ssim(original_gray, degraded_gray, data_range=255)
+            except:
+                ssim_value = 0.5
+            
+            # Bit Error Rate
+            ber = np.sum(np.abs(original_gray - degraded_gray) > 10) / original_gray.size * 100
+            
+            # Store metrics
+            self.metrics['time'].append(time_days)
+            self.metrics['psnr'].append(psnr_value if psnr_value != float('inf') else 50)
+            self.metrics['ssim'].append(ssim_value)
+            self.metrics['ber'].append(ber)
+            self.metrics['integrity'].append(state[4])  # x5: overall integrity
+            
+            print(f"Day {time_days:4.0f} ({time_days/365:4.1f} years):")
+            print(f"  States: x1={state[0]:5.1f}%, x2={state[1]:5.1f}%, x3={state[2]:5.1f}%, x4={state[3]:5.1f}%, x5={state[4]:5.1f}%")
+            print(f"  Metrics: PSNR={psnr_value:.2f}dB, SSIM={ssim_value:.3f}, BER={ber:.2f}%")
+        
+        print("\nSimulation complete!")
+        
+    def visualize_results(self):
+        """Create comprehensive visualization of results"""
+        fig = plt.figure(figsize=(16, 12))
+        gs = GridSpec(3, 3, figure=fig, hspace=0.3, wspace=0.3)
+        
+        # Plot 1: State variables over time
+        ax1 = fig.add_subplot(gs[0, :])
+        labels = ['Charge Integrity', 'Oxide Layer', 'ECC Capability', 
+                 'Physical Integrity', 'Overall Readability']
+        colors = ['blue', 'orange', 'green', 'red', 'purple']
+        for i, (label, color) in enumerate(zip(labels, colors)):
+            ax1.plot(self.time_points/365, self.states[:, i], label=label, linewidth=2, color=color)
+        ax1.set_xlabel('Time (years)', fontsize=12)
+        ax1.set_ylabel('Integrity (%)', fontsize=12)
+        ax1.set_title('System Degradation Over Time', fontsize=14, fontweight='bold')
+        ax1.legend(loc='lower left')
+        ax1.grid(True, alpha=0.3)
+        ax1.set_ylim([0, 105])
+        ax1.set_xlim([0, self.duration/365])
+        
+        # Plot 2: Image quality metrics
+        ax2 = fig.add_subplot(gs[1, 0])
+        ax2.plot(np.array(self.metrics['time'])/365, self.metrics['psnr'], 
+                'b-', linewidth=2, marker='o', markersize=8)
+        ax2.set_xlabel('Time (years)', fontsize=12)
+        ax2.set_ylabel('PSNR (dB)', fontsize=12)
+        ax2.set_title('Peak Signal-to-Noise Ratio', fontsize=13)
+        ax2.grid(True, alpha=0.3)
+        ax2.axhline(y=30, color='r', linestyle='--', alpha=0.5, label='Acceptable Quality')
+        ax2.axhline(y=20, color='r', linestyle='--', alpha=0.5, label='Poor Quality')
+        ax2.legend()
+        ax2.set_xlim([0, max(self.metrics['time'])/365])
+        
+        ax3 = fig.add_subplot(gs[1, 1])
+        ax3.plot(np.array(self.metrics['time'])/365, self.metrics['ssim'], 
+                'g-', linewidth=2, marker='s', markersize=8)
+        ax3.set_xlabel('Time (years)', fontsize=12)
+        ax3.set_ylabel('SSIM', fontsize=12)
+        ax3.set_title('Structural Similarity Index', fontsize=13)
+        ax3.grid(True, alpha=0.3)
+        ax3.set_ylim([0, 1.05])
+        ax3.axhline(y=0.8, color='r', linestyle='--', alpha=0.5, label='Good Quality')
+        ax3.axhline(y=0.5, color='r', linestyle='--', alpha=0.5, label='Poor Quality')
+        ax3.legend()
+        ax3.set_xlim([0, max(self.metrics['time'])/365])
+        
+        ax4 = fig.add_subplot(gs[1, 2])
+        ax4.plot(np.array(self.metrics['time'])/365, self.metrics['ber'], 
+                'r-', linewidth=2, marker='^', markersize=8)
+        ax4.set_xlabel('Time (years)', fontsize=12)
+        ax4.set_ylabel('BER (%)', fontsize=12)
+        ax4.set_title('Bit Error Rate', fontsize=13)
+        ax4.grid(True, alpha=0.3)
+        ax4.axhline(y=1, color='orange', linestyle='--', alpha=0.5, label='1% Threshold')
+        ax4.axhline(y=5, color='red', linestyle='--', alpha=0.5, label='5% Critical')
+        ax4.legend()
+        ax4.set_xlim([0, max(self.metrics['time'])/365])
+        
+        # Plot 3: Degraded images at key time points
+        time_labels = ['Original', 'Year 1', 'Year 2', 'Year 5', 'Year 10']
+        available_images = min(len(self.degraded_images), 5)
+        
+        for i in range(available_images):
+            ax = fig.add_subplot(gs[2, i % 3])
+            ax.imshow(self.degraded_images[i])
+            ax.set_title(f'{time_labels[i]}\nIntegrity: {self.metrics["integrity"][i]:.1f}%', 
+                        fontsize=11)
+            ax.axis('off')
+        
+        plt.suptitle('Digital Image Degradation in Flash Memory Storage', 
+                    fontsize=16, fontweight='bold', y=0.98)
+        
+        # Add timestamp
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        fig.text(0.99, 0.01, f'Generated: {timestamp}', ha='right', fontsize=8, alpha=0.5)
+        
+        plt.tight_layout()
+        return fig
+    
+    def save_results(self, output_dir='output'):
+        """Save simulation results to files"""
+        # Create output directory
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Save plots
+        fig = self.visualize_results()
+        fig.savefig(os.path.join(output_dir, 'degradation_analysis.png'), dpi=300, bbox_inches='tight')
+        print(f"\nResults saved to {output_dir}/")
+        
+        # Save degraded images
+        for i, img in enumerate(self.degraded_images):
+            time_days = self.metrics['time'][i]
+            filename = f'degraded_day_{time_days:04.0f}.png'
+            Image.fromarray(img).save(os.path.join(output_dir, filename))
+        
+        # Save metrics to CSV
+        import csv
+        csv_file = os.path.join(output_dir, 'metrics.csv')
+        with open(csv_file, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['Time (days)', 'Time (years)', 'PSNR (dB)', 'SSIM', 'BER (%)', 'Integrity (%)'])
+            for i in range(len(self.metrics['time'])):
+                writer.writerow([
+                    self.metrics['time'][i],
+                    self.metrics['time'][i]/365,
+                    self.metrics['psnr'][i],
+                    self.metrics['ssim'][i],
+                    self.metrics['ber'][i],
+                    self.metrics['integrity'][i]
+                ])
+        
+        # Save model parameters
+        params_file = os.path.join(output_dir, 'model_parameters.txt')
+        with open(params_file, 'w') as f:
+            f.write("DATA DEGRADATION MODEL PARAMETERS\n")
+            f.write("=" * 40 + "\n\n")
+            f.write("Degradation Rates (per day):\n")
+            f.write(f"  Charge Leakage (α₁): {self.model.alpha1:.8f}\n")
+            f.write(f"  Oxide Breakdown (α₂): {self.model.alpha2:.8f}\n")
+            f.write(f"  ECC Degradation (α₃): {self.model.alpha3:.8f}\n")
+            f.write(f"  Physical Degradation (α₄): {self.model.alpha4:.8f}\n")
+            f.write(f"  System Degradation (α₅): {self.model.alpha5:.8f}\n\n")
+            f.write("\nExpected Degradation (using exponential decay):\n")
+            f.write(f"  x1 after 10 years: {100 * np.exp(-self.model.alpha1 * 3650):.1f}%\n")
+            f.write(f"  x2 after 10 years: {100 * np.exp(-self.model.alpha2 * 3650):.1f}%\n")
+            f.write(f"  x3 after 10 years: {100 * np.exp(-self.model.alpha3 * 3650):.1f}%\n")
+            f.write(f"  x4 after 10 years: {100 * np.exp(-self.model.alpha4 * 3650):.1f}%\n")
+            f.write(f"  x5 after 10 years: {100 * np.exp(-self.model.alpha5 * 3650):.1f}%\n")
+        
+        print(f"Metrics saved to {csv_file}")
+        print(f"Parameters saved to {params_file}")
+
+
+def main():
+    """Main execution function"""
+    print("\n" + "="*60)
+    print("DIGITAL IMAGE DEGRADATION SIMULATION")
+    print("Flash Memory Storage Integrity Analysis")
+    print("="*60 + "\n")
+    
+    # Create and run simulation
+    simulator = DegradationSimulator(duration_days=3650, degradation_multiplier=1.0)
+    
+    # Run the simulation
+    simulator.run_simulation()
+    
+    # Visualize results
+    plt.ion()  # Interactive mode
+    simulator.visualize_results()
+    plt.show()
+    
+    # Save all results
+    simulator.save_results()
+    
+    print("\n" + "="*60)
+    print("SIMULATION COMPLETE")
+    print("Check the output folder for:")
+    print("  - degradation_analysis.png (main visualization)")
+    print("  - degraded_day_XXXX.png (images at different time points)")
+    print("  - metrics.csv (numerical data)")
+    print("  - model_parameters.txt (simulation parameters)")
+    print("="*60)
+    
+    # Keep plot window open
+    input("\nPress Enter to exit...")
+
+
+if __name__ == "__main__":
+    main()
